@@ -1,0 +1,96 @@
+%spark
+
+def parseWarc(record: String): Option[(String, String)] = {
+  val lines    = record.split("\n")
+  val uriLine  = lines.find(_.startsWith("WARC-Target-URI:")).getOrElse("")
+  if (uriLine.nonEmpty) {
+    val uri = uriLine.stripPrefix("WARC-Target-URI:").trim
+    val hdrEnd = lines.indexWhere(_.trim.isEmpty)
+    val text   =
+      if (hdrEnd >= 0 && hdrEnd + 1 < lines.length)
+        lines.drop(hdrEnd + 1).mkString(" ").replaceAll("\\s+", " ").trim
+      else
+        ""
+    Some((uri, text))
+  } else None
+}
+
+//  Language Detector 
+def detectLanguage(text: String): String = {
+  val lower = text.toLowerCase
+  val dutchWords  = Seq("de","het","een","en","van","ik","jij","wij","zijn")
+  val turkishWords= Seq("ve","bir","bu","şu","ile","olarak","değil","çok","için")
+  val dutchCount  = dutchWords.count(lower.contains)
+  val turkishCount= turkishWords.count(lower.contains)
+  if (turkishCount > dutchCount && turkishCount > 1) "tr"
+  else if (dutchCount  > turkishCount && dutchCount  > 1) "nl"
+  else "unknown"
+}                                                                                          
+
+// Good/Bad keyword sets 
+val goodKeywords = Set(
+  "özgürlük","lider","ilerici","kahraman","saygı","vizyoner","modern","aydın","bağımsızlık","reformcu","demokrat",
+  "inspiratie","vrijheid","respect","visionair","modernisering"
+)
+val badKeywords = Set(
+  "diktatör","katil","gerici","yobaz","faşist","baskıcı","zorba","nefreti","suistimal","çöküş",
+  "dictator","onderdrukker","tirannie","haat","achterlijk"
+)
+
+import org.apache.spark.rdd.RDD
+
+val documentsRDD: RDD[String] =
+  sc.textFile("file:///opt/zeppelin/CC-MAIN-*.warc.wet.gz")
+
+val uriTextRDD: RDD[(String, String)] = documentsRDD
+  .mapPartitions(_.mkString("\n").split("WARC/1.0").iterator)
+  .flatMap(parseWarc)
+  .filter { case (_, text) => text.length > 100 }
+
+// Detect language & filter to Turkish/Dutch
+val uriTextLangRDD = uriTextRDD.map { case (uri, text) =>
+  val lang = detectLanguage(text)
+  (uri, lang, text)
+}.filter { case (_, lang, _) => lang == "tr" || lang == "nl" }
+
+val labeledMentionsRDD = uriTextLangRDD.flatMap { case (uri, lang, text) =>
+  val mentions = text.split("""(?<=[.!?])\s+""").filter { s =>
+    val l = s.toLowerCase
+    l.contains("atatürk") || l.contains("ataturk") || l.contains("erdoğan") || l.contains("erdogan")
+  }
+  mentions.map { s =>
+    val lower = s.toLowerCase
+    val person = if (lower.contains("atatürk") || lower.contains("ataturk")) "Ataturk" else "Erdogan"
+    val good    = goodKeywords.count(k => lower.contains(k))
+    val bad     = badKeywords.count(k  => lower.contains(k))
+    val sentiment =
+      if (good > bad)                "positive"
+      else if (bad  > good)          "negative"
+      else if (good == 0 && bad == 0)"neutral"
+      else                            "ambiguous"
+    (uri, lang, person, sentiment)
+  }
+}
+
+
+val uriCountsByLang = labeledMentionsRDD
+  .map { case (_, lang, person, sentiment) => ((lang, person, sentiment), 1) }
+  .reduceByKey(_ + _)
+  .collect()
+
+uriCountsByLang.foreach { case ((lang, person, sentiment), count) =>
+  println(s"Language: $lang | $person | $sentiment $count")
+}
+
+val exampleURIs = labeledMentionsRDD
+  .map { case (uri, lang, person, sentiment) => ((lang, person, sentiment), uri) }
+  .distinct()
+  .aggregateByKey(List.empty[String])(
+    (acc, uri) => if (acc.size < 3) uri :: acc else acc,
+    (acc1, acc2) => (acc1 ++ acc2).distinct.take(3)
+  )
+
+exampleURIs.collect().foreach { case ((lang, person, sentiment), uris) =>
+  println(s"\n$lang | $person | $sentiment")
+  uris.foreach(u => println(s" - $u"))
+}
